@@ -1,0 +1,81 @@
+# Circle CI fallback — security audit while GitHub Actions is down.
+# Setup (one time): circleci.com -> Set Up Project on khaalidrafi/vuln-harness,
+# then add a Context "vuln-harness" (or project env vars) with:
+#   VAULT_READ_TOKEN — PAT/App token that can read the private vault repo
+#   HARNESS_DISCOVERY_MODEL / HARNESS_VALIDATION_MODEL — two DIFFERENT models
+# Fleet listing/cloning is tokenless (public repos).
+
+version: 2.1
+
+jobs:
+  fleet-security-audit:
+    docker:
+      - image: cimg/base:current
+    steps:
+      - checkout
+      - run:
+          name: Clone fleet (all public khaalidrafi repos)
+          command: |
+            mkdir -p fleet
+            curl -sf "https://api.github.com/users/khaalidrafi/repos?per_page=100" \
+              | python3 -c "import json,sys;[print(r['name']) for r in json.load(sys.stdin)]" \
+            | while read -r name; do
+                git clone -q --depth 1 --single-branch \
+                  "https://github.com/khaalidrafi/${name}.git" "fleet/${name}" \
+                  || echo "clone failed: ${name}"
+              done
+            echo "fleet size: $(ls fleet | wc -l)"
+      - run:
+          name: Run static security audit
+          command: |
+            python3 vh.py scan fleet/* --state state
+            python3 vh.py report --state state --out report.md
+            tail -40 report.md
+      - store_artifacts:
+          path: state
+      - store_artifacts:
+          path: report.md
+
+  llm-security-audit:
+    docker:
+      - image: cimg/base:current
+    parameters:
+      repo:
+        type: string
+    steps:
+      - checkout
+      - run:
+          name: Clone target repo
+          command: git clone -q --depth 1 "https://github.com/khaalidrafi/<< parameters.repo >>.git" target
+      - run:
+          name: Pull per-lane keys from the vault API (values never echoed)
+          command: |
+            vault_secret() {
+              curl -sf -H "Authorization: Bearer $VAULT_READ_TOKEN" \
+                "https://api.github.com/repos/khaalidrafi/vault/contents/secrets/$1" \
+                | python3 -c "import base64,json,sys;print(base64.b64decode(json.load(sys.stdin)['content']).decode(),end='')"
+            }
+            echo "export HARNESS_DISCOVERY_API_KEY=\"\$(vault_secret ${DISCOVERY_KEY_NAME:-ZAI_API_KEY})\"" >> lane_env
+            echo "export HARNESS_VALIDATION_API_KEY=\"\$(vault_secret ${VALIDATION_KEY_NAME:-OPENROUTER_API_KEY})\"" >> lane_env
+      - run:
+          name: Recon -> Hunt -> Validate (two models, two APIs if needed)
+          command: |
+            . ./lane_env
+            python3 harness/orchestrator.py run --repo target --name "<< parameters.repo >>"
+      - store_artifacts:
+          path: harness.db
+      - store_artifacts:
+          path: report-*.json
+
+workflows:
+  nightly:
+    triggers:
+      - schedule:
+          cron: "37 1 * * *"
+          filters: {branches: {only: main}}
+    jobs:
+      - fleet-security-audit
+  security-audit-on-demand:
+    jobs:
+      - llm-security-audit:
+          filters: {branches: {only: main}}

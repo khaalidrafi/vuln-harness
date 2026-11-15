@@ -1,0 +1,11 @@
+# Runtime artifacts (CI writes these; never committed — commit-hygiene law)
+__pycache__/
+state/findings.json
+state/queue.jsonl
+state/harness.db
+report.md
+report-*.md
+report-*.json
+harness.db
+fleet/
+target/

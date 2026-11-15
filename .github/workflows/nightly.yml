@@ -1,0 +1,120 @@
+# Nightly fleet audit — vuln-harness v2
+# Audits run in GitHub CI ONLY (master order 2026-11-12: never in the dev
+# sandbox). The fleet is PUBLIC, so listing + cloning needs no token;
+# AUDIT_TOKEN is optional (rate-limit headroom, private repos if any).
+# Findings go to an ARTIFACT (never commits — commit-hygiene law:
+# no bookkeeping-only commits).
+#
+# LLM stages (multi-model law: discovery model != validation model):
+# dispatch manually with run_llm=true + repo, needs secrets
+# HARNESS_API_KEY (+ optional HARNESS_BASE_URL) and vars
+# HARNESS_DISCOVERY_MODEL / HARNESS_VALIDATION_MODEL.
+
+name: nightly-fleet-audit
+
+on:
+  schedule:
+    - cron: '30 1 * * *'
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_llm:
+        description: 'Also run two-model LLM stages (Recon/Hunt/Validate) on `repo`'
+        type: boolean
+        default: false
+      repo:
+        description: 'Target repo for the LLM stages'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: fleet scan (discovery + validation + report)
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Checkout harness
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Clone fleet repos (shallow, fresh, tokenless)
+        env:
+          AUDIT_TOKEN: ${{ secrets.AUDIT_TOKEN }}
+        run: |
+          set -eu
+          mkdir -p fleet
+          AUTH=()
+          if [ -n "$AUDIT_TOKEN" ]; then
+            AUTH=(-H "Authorization: Bearer $AUDIT_TOKEN")
+          fi
+          curl -sf "${AUTH[@]}" \
+            "https://api.github.com/users/khaalidrafi/repos?per_page=100" \
+            | jq -r '.[].name' \
+          | while read -r name; do
+              git clone -q --depth 1 --single-branch \
+                "https://github.com/khaalidrafi/${name}.git" \
+                "fleet/${name}" || echo "::warning::clone failed ${name}"
+            done
+          echo "fleet size: $(ls fleet | wc -l)"
+
+      - name: Run harness (scan + report)
+        run: |
+          set -eu
+          python3 vh.py scan fleet/* --state state
+          python3 vh.py report --state state --out report.md
+          echo "### audit summary" >> "$GITHUB_STEP_SUMMARY"
+          grep -E "^\| " report.md | head -40 >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Upload audit artifact (state + report, 30 days)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: audit-fleet
+          path: |
+            state/
+            report.md
+          retention-days: 30
+
+  llm-harness:
+    name: two-model LLM stages (Recon -> Hunt -> Validate)
+    runs-on: ubuntu-latest
+    needs: audit
+    if: ${{ github.event.inputs.run_llm == 'true' && github.event.inputs.repo != '' }}
+    timeout-minutes: 55
+    steps:
+      - name: Checkout harness
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Clone target repo
+        run: |
+          git clone -q --depth 1 \
+            "https://github.com/khaalidrafi/${{ github.event.inputs.repo }}.git" target
+
+      - name: Recon -> Hunt -> Validate (discovery model != validation model)
+        env:
+          # per-lane credentials: models may not exist on one API.
+          # unset lanes fall back to the shared HARNESS_* values.
+          HARNESS_API_KEY: ${{ secrets.HARNESS_API_KEY }}
+          HARNESS_BASE_URL: ${{ secrets.HARNESS_BASE_URL }}
+          HARNESS_DISCOVERY_API_KEY: ${{ secrets.HARNESS_DISCOVERY_API_KEY }}
+          HARNESS_DISCOVERY_BASE_URL: ${{ secrets.HARNESS_DISCOVERY_BASE_URL }}
+          HARNESS_VALIDATION_API_KEY: ${{ secrets.HARNESS_VALIDATION_API_KEY }}
+          HARNESS_VALIDATION_BASE_URL: ${{ secrets.HARNESS_VALIDATION_BASE_URL }}
+          HARNESS_DISCOVERY_MODEL: ${{ vars.HARNESS_DISCOVERY_MODEL }}
+          HARNESS_VALIDATION_MODEL: ${{ vars.HARNESS_VALIDATION_MODEL }}
+        run: |
+          python3 harness/orchestrator.py run --repo target \
+            --name "${{ github.event.inputs.repo }}"
+
+      - name: Upload LLM report (DB + findings JSON)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: llm-harness-report
+          path: |
+            harness.db
+            report-*.json
+          retention-days: 30
